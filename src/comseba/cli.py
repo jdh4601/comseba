@@ -21,6 +21,7 @@ from comseba.criteria_extractor import (
     Criterion,
     EvaluationCriteriaExtractor,
 )
+from comseba.level import SchoolLevel
 from comseba.model_answer_generator import ModelAnswerGenerator
 from comseba.profile_builder import StudentProfile, StudentProfileBuilder
 from comseba.report_generator import ReportGenerator
@@ -72,6 +73,7 @@ class _SessionContext:
     profile: StudentProfile | None = None
     profile_updated_at: str | None = None  # ISO 시각, session.json 영속화
     profile_action: str | None = None      # "reused" / "updated" / "rebuilt" / "created"
+    level: SchoolLevel | None = None
     subject: Subject | None = None
     criteria: list[Criterion] | None = None
     suggestions: list[AssessmentIdea] = field(default_factory=list)
@@ -187,6 +189,19 @@ def _ask_subject() -> Subject:
     return Subject.preset(choice)
 
 
+def _ask_level() -> SchoolLevel:
+    """Ask for the student's school level. Exactly two choices — no Other."""
+    choice = _ask_select(
+        "학생의 학교급을 선택하세요",
+        [SchoolLevel.MIDDLE.label_ko, SchoolLevel.HIGH.label_ko],
+    )
+    return (
+        SchoolLevel.MIDDLE
+        if choice == SchoolLevel.MIDDLE.label_ko
+        else SchoolLevel.HIGH
+    )
+
+
 # ---------------------------------------------------------------------------
 # Pipeline — pure orchestration, no questionary calls. Tests drive this directly.
 # ---------------------------------------------------------------------------
@@ -242,6 +257,7 @@ class Pipeline:
             career_text=career_text,
             kakao_image_paths=(kakao_paths or None),
             career_hwp_paths=(career_hwp_paths or None),
+            level=ctx.level,
         )
         stamp = (now or datetime.now()).strftime("%Y-%m-%dT%H:%M:%S")
         payload = {
@@ -289,7 +305,7 @@ class Pipeline:
         if STEP_CRITERIA in ctx.completed and ctx.criteria is not None:
             return ctx.criteria
         criteria = self._m.criteria_extractor.extract(
-            image_paths, subject=ctx.subject
+            image_paths, subject=ctx.subject, level=ctx.level
         )
         ctx.criteria = criteria
         ctx.storage.save_json(
@@ -313,7 +329,11 @@ class Pipeline:
         else:
             assert ctx.profile is not None and ctx.criteria is not None
             ctx.suggestions = self._m.suggestion_engine.suggest(
-                ctx.profile, ctx.criteria, count=count, subject=ctx.subject
+                ctx.profile,
+                ctx.criteria,
+                count=count,
+                subject=ctx.subject,
+                level=ctx.level,
             )
         ctx.storage.save_json(
             ctx.session_path,
@@ -339,6 +359,7 @@ class Pipeline:
             submission_image_paths=image_paths or None,
             submission_pdf_paths=pdf_paths or None,
             subject=ctx.subject,
+            level=ctx.level,
         )
         ctx.evaluation = evaluation
         ctx.storage.save_json(
@@ -358,6 +379,7 @@ class Pipeline:
             ctx.profile,
             evaluation=ctx.evaluation,
             subject=ctx.subject,
+            level=ctx.level,
         )
         ctx.storage.save_text(ctx.session_path, "model_answer.txt", ctx.model_answer)
         ctx.mark(STEP_MODEL_ANSWER)
@@ -379,6 +401,7 @@ class Pipeline:
             ctx.model_answer,
             profile_updated_at=ctx.profile_updated_at,
             subject=ctx.subject,
+            level=ctx.level,
         )
         ctx.storage.save_text(ctx.session_path, "report.md", report)
         ctx.mark(STEP_REPORT)
@@ -394,6 +417,7 @@ class Pipeline:
             ctx.evaluation,
             assessment_name=assessment_name,
             subject=ctx.subject,
+            level=ctx.level,
         )
         ctx.storage.save_text(ctx.session_path, "sms.txt", sms)
         ctx.mark(STEP_SMS)
@@ -546,12 +570,22 @@ def _run(debug: bool = False) -> int:
         print("학생 이름이 비어 있어 종료합니다.")
         return 1
 
+    # 학교급은 세션 단위 결정 — 학년 변경 시기에 같은 학생이라도 바뀔 수 있으므로
+    # 매 세션 시작 시 다시 묻는다. 같은 세션 안에서는 변경 불가.
+    level = _ask_level()
+
     # 구 세션 (학생 디렉토리에 profile.json 없음 + 세션 안에는 있음) → 1회성 끌어올림.
     if storage.migrate_session_profile_to_student(student_name):
         print("(이전 세션의 학생 프로필을 학생 디렉토리로 이동했습니다.)\n")
 
     ctx = _open_or_create_session(storage, student_name)
-    print(f"세션 경로: {ctx.session_path}\n")
+    ctx.level = level
+    # 영속화 — 같은 세션 재개 시 디스크에서 복원, 또 묻지 않음.
+    state = storage.load_session_state(ctx.session_path)
+    state["level"] = level.value
+    storage.save_json(ctx.session_path, "session.json", state)
+    print(f"세션 경로: {ctx.session_path}")
+    print(f"학교급: {level.short_ko}\n")
 
     # Step 1-2: profile
     if STEP_PROFILE not in ctx.completed:

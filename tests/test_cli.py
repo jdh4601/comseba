@@ -453,3 +453,47 @@ def test_resume_restores_subject_from_session_json(tmp_path: Path) -> None:
     _restore_state(ctx)
 
     assert ctx.subject == Subject.custom("음악")
+
+
+# ---------------------------------------------------------------------------
+# COM-19: school level flows into every module call from ctx.level
+# ---------------------------------------------------------------------------
+
+
+def test_pipeline_passes_level_to_all_llm_modules(
+    ctx: _SessionContext,
+) -> None:
+    from comseba.level import SchoolLevel
+    from comseba.subject import Subject
+
+    ctx.level = SchoolLevel.HIGH
+    modules = _modules()
+    p = Pipeline(modules)
+    p.run_profile(ctx, "career", [])
+    p.run_subject(ctx, Subject.preset("국어"))
+    p.run_criteria(ctx, [Path("r.png")])
+    p.run_suggestions(ctx, skip=False)
+    p.run_evaluation(ctx, "본문", [], [])
+    p.run_model_answer(ctx)
+    p.run_report(ctx)
+    p.run_sms(ctx, assessment_name="x")
+
+    assert modules.profile_builder.build.call_args.kwargs["level"] == SchoolLevel.HIGH
+    assert modules.criteria_extractor.extract.call_args.kwargs["level"] == SchoolLevel.HIGH
+    assert modules.suggestion_engine.suggest.call_args.kwargs["level"] == SchoolLevel.HIGH
+    assert modules.submission_evaluator.evaluate.call_args.kwargs["level"] == SchoolLevel.HIGH
+    assert modules.model_answer_generator.generate.call_args.kwargs["level"] == SchoolLevel.HIGH
+    assert modules.report_generator.generate.call_args.kwargs["level"] == SchoolLevel.HIGH
+    assert modules.sms_generator.generate.call_args.kwargs["level"] == SchoolLevel.HIGH
+
+
+def test_pipeline_passes_none_level_when_not_set(
+    ctx: _SessionContext,
+) -> None:
+    """Regression: omitting level on _SessionContext must propagate as None."""
+    modules = _modules()
+    p = Pipeline(modules)
+
+    p.run_profile(ctx, "career", [])
+
+    assert modules.profile_builder.build.call_args.kwargs["level"] is None

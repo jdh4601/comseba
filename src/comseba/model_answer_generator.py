@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 from comseba.client import DEFAULT_MODEL, get_client
 from comseba.criteria_extractor import Criterion
+from comseba.level import SchoolLevel, format_level_block
 from comseba.profile_builder import StudentProfile
 from comseba.subject import Subject, format_subject_block
 from comseba.submission_evaluator import CriterionFeedback
@@ -69,6 +70,7 @@ class ModelAnswerGenerator:
         profile: StudentProfile,
         evaluation: list[CriterionFeedback] | None = None,
         subject: Subject | None = None,
+        level: SchoolLevel | None = None,
     ) -> str:
         if not criteria:
             raise ValueError("평가 기준이 비어 있습니다.")
@@ -87,7 +89,8 @@ class ModelAnswerGenerator:
             max_tokens=self._max_tokens,
             system=_SYSTEM_PROMPT
             + f"\n\n[현재 분석 대상 학생의 진로]\n{profile.career_goal}"
-            + format_subject_block(subject),
+            + format_subject_block(subject)
+            + format_level_block(level),
             messages=[{"role": "user", "content": prompt}],
         )
         body = "".join(
