@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 from comseba.client import DEFAULT_MODEL, get_client
 from comseba.hwp_parser import HwpParser
 from comseba.image_parser import ImageParser
+from comseba.level import SchoolLevel, format_level_block
 
 if TYPE_CHECKING:
     from anthropic import Anthropic
@@ -91,6 +92,7 @@ class StudentProfileBuilder:
         career_text: str | None = None,
         kakao_image_paths: list[Path] | None = None,
         career_hwp_paths: list[Path] | None = None,
+        level: SchoolLevel | None = None,
     ) -> StudentProfile:
         if not name.strip():
             raise ValueError("학생 이름이 비어 있습니다.")
@@ -113,7 +115,9 @@ class StudentProfileBuilder:
         response = self._client.messages.create(
             model=self._model,
             max_tokens=1024,
-            system=_SYSTEM_PROMPT + f"\n\n[현재 분석 대상 학생의 진로]\n{combined_career}",
+            system=_SYSTEM_PROMPT
+            + f"\n\n[현재 분석 대상 학생의 진로]\n{combined_career}"
+            + format_level_block(level),
             messages=[{"role": "user", "content": prompt}],
         )
 

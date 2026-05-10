@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 from comseba.criteria_extractor import Criterion
+from comseba.level import SchoolLevel
 from comseba.profile_builder import StudentProfile
 from comseba.subject import Subject
 from comseba.submission_evaluator import CriterionFeedback
@@ -28,6 +29,7 @@ class ReportGenerator:
         model_answer: str,
         profile_updated_at: str | None = None,
         subject: Subject | None = None,
+        level: SchoolLevel | None = None,
     ) -> str:
         if not criteria:
             raise ValueError("평가 기준이 비어 있습니다.")
@@ -36,7 +38,7 @@ class ReportGenerator:
 
         sections = [
             f"# 수행평가 보고서 — {profile.name}",
-            _career_section(profile, profile_updated_at, subject),
+            _career_section(profile, profile_updated_at, subject, level),
             _criteria_section(criteria),
             _evaluation_section(evaluation),
             _model_answer_section(model_answer),
@@ -49,8 +51,11 @@ def _career_section(
     profile: StudentProfile,
     profile_updated_at: str | None = None,
     subject: Subject | None = None,
+    level: SchoolLevel | None = None,
 ) -> str:
     lines = ["## 학생 진로 요약", "", f"- **이름**: {profile.name}", f"- **진로 / 목표**: {profile.career_goal}"]
+    if level is not None:
+        lines.append(f"- **학교급**: {level.short_ko}")
     if subject is not None:
         lines.append(f"- **과목**: {subject.name}")
     if profile.inferred_needs:
