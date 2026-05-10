@@ -371,3 +371,85 @@ def test_run_report_passes_profile_updated_at(ctx: _SessionContext) -> None:
 
     _, kwargs = modules.report_generator.generate.call_args
     assert kwargs["profile_updated_at"] == ctx.profile_updated_at
+
+
+# ---------------------------------------------------------------------------
+# COM-18: subject step persists + flows into all module calls
+# ---------------------------------------------------------------------------
+
+
+def test_run_subject_persists_to_session_json(ctx: _SessionContext) -> None:
+    from comseba.cli import STEP_SUBJECT
+    from comseba.subject import Subject
+
+    p = Pipeline(_modules())
+
+    p.run_subject(ctx, Subject.preset("국어"))
+
+    assert ctx.subject == Subject.preset("국어")
+    assert STEP_SUBJECT in ctx.completed
+    state = ctx.storage.load_session_state(ctx.session_path)
+    assert state["subject"] == {"name": "국어", "is_custom": False}
+
+
+def test_run_subject_is_idempotent_when_already_completed(
+    ctx: _SessionContext,
+) -> None:
+    from comseba.subject import Subject
+
+    p = Pipeline(_modules())
+    first = Subject.preset("수학")
+    p.run_subject(ctx, first)
+    # 재호출은 변경 없이 기존 값 반환.
+    second = p.run_subject(ctx, Subject.preset("과학"))
+
+    assert second == first
+    assert ctx.subject == first
+
+
+def test_pipeline_passes_subject_to_all_llm_modules(
+    ctx: _SessionContext,
+) -> None:
+    from comseba.subject import Subject
+
+    modules = _modules()
+    p = Pipeline(modules)
+    p.run_profile(ctx, "career", [])
+    p.run_subject(ctx, Subject.preset("역사"))
+    p.run_criteria(ctx, [Path("r.png")])
+    p.run_suggestions(ctx, skip=False)
+    p.run_evaluation(ctx, "본문", [], [])
+    p.run_model_answer(ctx)
+    p.run_report(ctx)
+    p.run_sms(ctx, assessment_name="x")
+
+    expected = Subject.preset("역사")
+    assert modules.criteria_extractor.extract.call_args.kwargs["subject"] == expected
+    assert modules.suggestion_engine.suggest.call_args.kwargs["subject"] == expected
+    assert modules.submission_evaluator.evaluate.call_args.kwargs["subject"] == expected
+    assert modules.model_answer_generator.generate.call_args.kwargs["subject"] == expected
+    assert modules.report_generator.generate.call_args.kwargs["subject"] == expected
+    assert modules.sms_generator.generate.call_args.kwargs["subject"] == expected
+
+
+def test_resume_restores_subject_from_session_json(tmp_path: Path) -> None:
+    from comseba.cli import STEP_SUBJECT, _restore_state
+    from comseba.subject import Subject
+
+    storage = LocalStorage(base_dir=tmp_path / "students")
+    session_path = storage.new_session("홍길동")
+    # Pretend the subject step already ran in a prior session run
+    state = storage.load_session_state(session_path)
+    state["subject"] = {"name": "음악", "is_custom": True}
+    state["completed_steps"] = [STEP_SUBJECT]
+    storage.save_json(session_path, "session.json", state)
+
+    ctx = _SessionContext(
+        storage=storage,
+        session_path=session_path,
+        student_name="홍길동",
+        completed={STEP_SUBJECT},
+    )
+    _restore_state(ctx)
+
+    assert ctx.subject == Subject.custom("음악")

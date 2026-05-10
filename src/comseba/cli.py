@@ -26,6 +26,7 @@ from comseba.profile_builder import StudentProfile, StudentProfileBuilder
 from comseba.report_generator import ReportGenerator
 from comseba.sms_generator import SmsContentGenerator
 from comseba.storage import LocalStorage
+from comseba.subject import SUBJECT_PRESETS, Subject
 from comseba.submission_evaluator import (
     CriterionFeedback,
     SubmissionEvaluator,
@@ -37,6 +38,7 @@ from comseba.suggestion_engine import (
 
 # 각 스텝에 부여한 이름 — session.json 의 completed_steps 에 기록되는 키.
 STEP_PROFILE = "profile"
+STEP_SUBJECT = "subject"
 STEP_CRITERIA = "criteria"
 STEP_SUGGESTIONS = "suggestions"
 STEP_EVALUATION = "evaluation"
@@ -70,6 +72,7 @@ class _SessionContext:
     profile: StudentProfile | None = None
     profile_updated_at: str | None = None  # ISO 시각, session.json 영속화
     profile_action: str | None = None      # "reused" / "updated" / "rebuilt" / "created"
+    subject: Subject | None = None
     criteria: list[Criterion] | None = None
     suggestions: list[AssessmentIdea] = field(default_factory=list)
     evaluation: list[CriterionFeedback] | None = None
@@ -168,6 +171,22 @@ def _filter_hwp_paths(paths: list[Path]) -> list[Path]:
     return kept
 
 
+_SUBJECT_CUSTOM_LABEL = "직접 입력"
+
+
+def _ask_subject() -> Subject:
+    """Ask the teacher for the subject of this assessment.
+
+    Seven presets + free-text fallback. Returns a `Subject` value.
+    """
+    choices = list(SUBJECT_PRESETS) + [_SUBJECT_CUSTOM_LABEL]
+    choice = _ask_select("어떤 과목의 수행평가인가요?", choices)
+    if choice == _SUBJECT_CUSTOM_LABEL:
+        custom = _ask_text("과목명을 입력하세요").strip()
+        return Subject.custom(custom)
+    return Subject.preset(choice)
+
+
 # ---------------------------------------------------------------------------
 # Pipeline — pure orchestration, no questionary calls. Tests drive this directly.
 # ---------------------------------------------------------------------------
@@ -250,12 +269,28 @@ class Pipeline:
         state["profile_action"] = ctx.profile_action
         ctx.storage.save_json(ctx.session_path, "session.json", state)
 
+    def run_subject(
+        self, ctx: _SessionContext, subject: Subject
+    ) -> Subject:
+        """Persist the chosen subject. Pure metadata step — no LLM call."""
+        if STEP_SUBJECT in ctx.completed and ctx.subject is not None:
+            return ctx.subject
+        ctx.subject = subject
+        # session.json 에 직렬화 형태로 저장 → 재개 시 복원.
+        state = ctx.storage.load_session_state(ctx.session_path)
+        state["subject"] = subject.to_dict()
+        ctx.storage.save_json(ctx.session_path, "session.json", state)
+        ctx.mark(STEP_SUBJECT)
+        return subject
+
     def run_criteria(
         self, ctx: _SessionContext, image_paths: list[Path]
     ) -> list[Criterion]:
         if STEP_CRITERIA in ctx.completed and ctx.criteria is not None:
             return ctx.criteria
-        criteria = self._m.criteria_extractor.extract(image_paths)
+        criteria = self._m.criteria_extractor.extract(
+            image_paths, subject=ctx.subject
+        )
         ctx.criteria = criteria
         ctx.storage.save_json(
             ctx.session_path,
@@ -278,7 +313,7 @@ class Pipeline:
         else:
             assert ctx.profile is not None and ctx.criteria is not None
             ctx.suggestions = self._m.suggestion_engine.suggest(
-                ctx.profile, ctx.criteria, count=count
+                ctx.profile, ctx.criteria, count=count, subject=ctx.subject
             )
         ctx.storage.save_json(
             ctx.session_path,
@@ -303,6 +338,7 @@ class Pipeline:
             submission_text=submission_text,
             submission_image_paths=image_paths or None,
             submission_pdf_paths=pdf_paths or None,
+            subject=ctx.subject,
         )
         ctx.evaluation = evaluation
         ctx.storage.save_json(
@@ -318,7 +354,10 @@ class Pipeline:
             return ctx.model_answer
         assert ctx.profile is not None and ctx.criteria is not None
         ctx.model_answer = self._m.model_answer_generator.generate(
-            ctx.criteria, ctx.profile, evaluation=ctx.evaluation
+            ctx.criteria,
+            ctx.profile,
+            evaluation=ctx.evaluation,
+            subject=ctx.subject,
         )
         ctx.storage.save_text(ctx.session_path, "model_answer.txt", ctx.model_answer)
         ctx.mark(STEP_MODEL_ANSWER)
@@ -339,6 +378,7 @@ class Pipeline:
             ctx.evaluation,
             ctx.model_answer,
             profile_updated_at=ctx.profile_updated_at,
+            subject=ctx.subject,
         )
         ctx.storage.save_text(ctx.session_path, "report.md", report)
         ctx.mark(STEP_REPORT)
@@ -350,7 +390,10 @@ class Pipeline:
         assert ctx.profile is not None and ctx.evaluation is not None
         ctx.assessment_name = assessment_name
         sms = self._m.sms_generator.generate(
-            ctx.profile, ctx.evaluation, assessment_name=assessment_name
+            ctx.profile,
+            ctx.evaluation,
+            assessment_name=assessment_name,
+            subject=ctx.subject,
         )
         ctx.storage.save_text(ctx.session_path, "sms.txt", sms)
         ctx.mark(STEP_SMS)
@@ -419,6 +462,11 @@ def _restore_state(ctx: _SessionContext) -> None:
         state = ctx.storage.load_session_state(sp)
         ctx.profile_updated_at = state.get("profile_updated_at")
         ctx.profile_action = state.get("profile_action")
+    if STEP_SUBJECT in ctx.completed:
+        state = ctx.storage.load_session_state(sp)
+        subject_data = state.get("subject")
+        if subject_data:
+            ctx.subject = Subject.from_dict(subject_data)
     if STEP_CRITERIA in ctx.completed:
         ctx.criteria = _criteria_from_dict(ctx.storage.load_json(sp, "rubric.json"))
     if STEP_SUGGESTIONS in ctx.completed:
@@ -545,6 +593,12 @@ def _run(debug: bool = False) -> int:
                 force_rebuild=force_rebuild,
             )
             print("✓ 학생 프로필 생성 완료\n")
+
+    # Step 2.5: subject (이번 수행평가의 과목 — 다운스트림 system prompt 에 컨텍스트로)
+    if STEP_SUBJECT not in ctx.completed:
+        subject = _ask_subject()
+        pipeline.run_subject(ctx, subject)
+        print(f"✓ 과목 선택: {subject.name}\n")
 
     # Step 3: criteria
     if STEP_CRITERIA not in ctx.completed:
