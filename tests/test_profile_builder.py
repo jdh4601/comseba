@@ -126,5 +126,59 @@ def test_build_rejects_empty_name_or_career(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError):
         builder.build(name="  ", career_text="진로")
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="진로 정보"):
         builder.build(name="홍길동", career_text="")
+    with pytest.raises(ValueError, match="진로 정보"):
+        builder.build(name="홍길동")  # neither text nor hwp
+
+
+def test_build_with_hwp_paths_only_uses_extracted_text(tmp_path: Path) -> None:
+    hwp = tmp_path / "career.hwpx"
+    hwp.write_bytes(b"x")
+
+    hwp_parser = MagicMock()
+    hwp_parser.parse.return_value = "HWP 에서 추출한 진로: 응급실 간호사가 되고 싶다."
+    client = _mock_client(_profile_json(["응급 의료 사례 학습"]))
+    builder = StudentProfileBuilder(client=client, hwp_parser=hwp_parser)
+
+    profile = builder.build(name="홍길동", career_hwp_paths=[hwp])
+
+    hwp_parser.parse.assert_called_once_with(hwp)
+    assert "응급실 간호사" in profile.career_goal
+    # System prompt 의 personalization anchor 에도 들어가야 함
+    system = client.messages.create.call_args.kwargs["system"]
+    assert "응급실 간호사" in system
+
+
+def test_build_with_text_and_hwp_combines_both_into_career_goal(
+    tmp_path: Path,
+) -> None:
+    hwp = tmp_path / "career.hwp"
+    hwp.write_bytes(b"x")
+
+    hwp_parser = MagicMock()
+    hwp_parser.parse.return_value = "HWP 본문"
+    builder = StudentProfileBuilder(
+        client=_mock_client(_profile_json(["x"])),
+        hwp_parser=hwp_parser,
+    )
+
+    profile = builder.build(
+        name="홍길동",
+        career_text="짧은 텍스트 입력",
+        career_hwp_paths=[hwp],
+    )
+
+    assert "짧은 텍스트 입력" in profile.career_goal
+    assert "HWP 본문" in profile.career_goal
+
+
+def test_build_does_not_invoke_hwp_parser_when_not_provided(tmp_path: Path) -> None:
+    hwp_parser = MagicMock()
+    builder = StudentProfileBuilder(
+        client=_mock_client(_profile_json([])), hwp_parser=hwp_parser
+    )
+
+    builder.build(name="홍길동", career_text="진로")
+
+    hwp_parser.parse.assert_not_called()
