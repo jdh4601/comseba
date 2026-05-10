@@ -12,6 +12,7 @@ from __future__ import annotations
 import sys
 import traceback
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 import questionary
@@ -67,6 +68,8 @@ class _SessionContext:
     completed: set[str] = field(default_factory=set)
 
     profile: StudentProfile | None = None
+    profile_updated_at: str | None = None  # ISO 시각, session.json 영속화
+    profile_action: str | None = None      # "reused" / "updated" / "rebuilt" / "created"
     criteria: list[Criterion] | None = None
     suggestions: list[AssessmentIdea] = field(default_factory=list)
     evaluation: list[CriterionFeedback] | None = None
@@ -183,27 +186,69 @@ class Pipeline:
     def run_profile(
         self,
         ctx: _SessionContext,
-        career_text: str | None,
-        kakao_paths: list[Path],
+        career_text: str | None = None,
+        kakao_paths: list[Path] | None = None,
         career_hwp_paths: list[Path] | None = None,
         career_source: str = "text",
+        force_rebuild: bool = False,
+        now: datetime | None = None,
     ) -> StudentProfile:
+        """Build (or reuse) the student-level profile.
+
+        Behaviour matrix:
+        - already loaded for this session → return as-is.
+        - force_rebuild=False AND student profile exists on disk → load it,
+          mark step done, no LLM call (action: 'reused').
+        - force_rebuild=True OR no student profile on disk → call LLM,
+          archive previous (if any) into profile_history/, write new
+          students/{name}/profile.json (action: 'updated' or 'created').
+        """
         if STEP_PROFILE in ctx.completed and ctx.profile is not None:
             return ctx.profile
+
+        storage = ctx.storage
+        had_existing = storage.has_profile(ctx.student_name)
+
+        if not force_rebuild and had_existing:
+            data = storage.load_profile(ctx.student_name)
+            ctx.profile = _profile_from_dict(data)
+            ctx.profile_updated_at = data.get("updated_at")
+            ctx.profile_action = "reused"
+            self._record_profile_session_meta(ctx)
+            ctx.mark(STEP_PROFILE)
+            return ctx.profile
+
         profile = self._m.profile_builder.build(
             ctx.student_name,
             career_text=career_text,
-            kakao_image_paths=kakao_paths or None,
-            career_hwp_paths=career_hwp_paths or None,
+            kakao_image_paths=(kakao_paths or None),
+            career_hwp_paths=(career_hwp_paths or None),
+        )
+        stamp = (now or datetime.now()).strftime("%Y-%m-%dT%H:%M:%S")
+        payload = {
+            **_profile_to_dict(profile),
+            "career_source": career_source,
+            "updated_at": stamp,
+        }
+        storage.save_profile(
+            ctx.student_name, payload, archive_previous=had_existing, now=now
         )
         ctx.profile = profile
-        ctx.storage.save_json(
-            ctx.session_path,
-            "profile.json",
-            {**_profile_to_dict(profile), "career_source": career_source},
-        )
+        ctx.profile_updated_at = stamp
+        ctx.profile_action = "updated" if had_existing else "created"
+        self._record_profile_session_meta(ctx)
         ctx.mark(STEP_PROFILE)
         return profile
+
+    @staticmethod
+    def _record_profile_session_meta(ctx: _SessionContext) -> None:
+        """Persist profile_updated_at + profile_action into session.json so
+        sessions remain reproducible (we know exactly which profile snapshot
+        each session ran against)."""
+        state = ctx.storage.load_session_state(ctx.session_path)
+        state["profile_updated_at"] = ctx.profile_updated_at
+        state["profile_action"] = ctx.profile_action
+        ctx.storage.save_json(ctx.session_path, "session.json", state)
 
     def run_criteria(
         self, ctx: _SessionContext, image_paths: list[Path]
@@ -289,7 +334,11 @@ class Pipeline:
             and ctx.model_answer is not None
         )
         report = self._m.report_generator.generate(
-            ctx.profile, ctx.criteria, ctx.evaluation, ctx.model_answer
+            ctx.profile,
+            ctx.criteria,
+            ctx.evaluation,
+            ctx.model_answer,
+            profile_updated_at=ctx.profile_updated_at,
         )
         ctx.storage.save_text(ctx.session_path, "report.md", report)
         ctx.mark(STEP_REPORT)
@@ -359,7 +408,17 @@ def _restore_state(ctx: _SessionContext) -> None:
     """Rehydrate dataclass state from disk for any already-completed step."""
     sp = ctx.session_path
     if STEP_PROFILE in ctx.completed:
-        ctx.profile = _profile_from_dict(ctx.storage.load_json(sp, "profile.json"))
+        # 학생 단위 프로필이 source of truth. 구 세션의 세션 안 profile.json 은
+        # _run() 진입 시 마이그레이션이 학생 레벨로 끌어올렸을 것.
+        if ctx.storage.has_profile(ctx.student_name):
+            data = ctx.storage.load_profile(ctx.student_name)
+            ctx.profile = _profile_from_dict(data)
+        else:
+            # 마이그레이션이 실패한 매우 구 세션 — 호환을 위해 세션 디렉토리 fallback.
+            ctx.profile = _profile_from_dict(ctx.storage.load_json(sp, "profile.json"))
+        state = ctx.storage.load_session_state(sp)
+        ctx.profile_updated_at = state.get("profile_updated_at")
+        ctx.profile_action = state.get("profile_action")
     if STEP_CRITERIA in ctx.completed:
         ctx.criteria = _criteria_from_dict(ctx.storage.load_json(sp, "rubric.json"))
     if STEP_SUGGESTIONS in ctx.completed:
@@ -414,6 +473,21 @@ def _open_or_create_session(storage: LocalStorage, student_name: str) -> _Sessio
     )
 
 
+_PROFILE_REUSE = "그대로 사용"
+_PROFILE_UPDATE = "업데이트 (새 진로 정보 입력 → 기존은 history 로 보존)"
+_PROFILE_REBUILD = "처음부터 다시 만들기 (기존을 history 로 보존)"
+
+
+def _summarize_profile(data: dict) -> str:
+    needs = ", ".join(data.get("inferred_needs") or []) or "(없음)"
+    updated = data.get("updated_at") or "(시각 정보 없음)"
+    return (
+        f"  진로: {data.get('career_goal', '(없음)')[:80]}\n"
+        f"  니즈: {needs}\n"
+        f"  마지막 갱신: {updated}"
+    )
+
+
 def _run(debug: bool = False) -> int:
     print("=== 수행평가 보조 AI (comseba) ===\n")
     storage = LocalStorage()
@@ -424,21 +498,53 @@ def _run(debug: bool = False) -> int:
         print("학생 이름이 비어 있어 종료합니다.")
         return 1
 
+    # 구 세션 (학생 디렉토리에 profile.json 없음 + 세션 안에는 있음) → 1회성 끌어올림.
+    if storage.migrate_session_profile_to_student(student_name):
+        print("(이전 세션의 학생 프로필을 학생 디렉토리로 이동했습니다.)\n")
+
     ctx = _open_or_create_session(storage, student_name)
     print(f"세션 경로: {ctx.session_path}\n")
 
     # Step 1-2: profile
     if STEP_PROFILE not in ctx.completed:
-        career_text, hwp_paths, source = _ask_career_inputs()
-        kakao_paths = _ask_path_list("카카오톡 스크린샷 경로")
-        pipeline.run_profile(
-            ctx,
-            career_text=career_text,
-            kakao_paths=kakao_paths,
-            career_hwp_paths=hwp_paths,
-            career_source=source,
-        )
-        print("✓ 학생 프로필 생성 완료\n")
+        force_rebuild = False
+        if storage.has_profile(student_name):
+            existing = storage.load_profile(student_name)
+            print("[기존 학생 프로필 발견]")
+            print(_summarize_profile(existing))
+            print()
+            choice = _ask_select(
+                "프로필을 어떻게 처리할까요?",
+                [_PROFILE_REUSE, _PROFILE_UPDATE, _PROFILE_REBUILD],
+            )
+            if choice == _PROFILE_REUSE:
+                pipeline.run_profile(ctx, force_rebuild=False)
+                print("✓ 기존 프로필을 그대로 사용합니다.\n")
+            else:
+                # update / rebuild 모두 새 LLM 호출 + 기존을 history 로 백업.
+                career_text, hwp_paths, source = _ask_career_inputs()
+                kakao_paths = _ask_path_list("카카오톡 스크린샷 경로")
+                pipeline.run_profile(
+                    ctx,
+                    career_text=career_text,
+                    kakao_paths=kakao_paths,
+                    career_hwp_paths=hwp_paths,
+                    career_source=source,
+                    force_rebuild=True,
+                )
+                print("✓ 프로필을 갱신했습니다. (이전 버전은 profile_history/ 에 보관)\n")
+        else:
+            career_text, hwp_paths, source = _ask_career_inputs()
+            kakao_paths = _ask_path_list("카카오톡 스크린샷 경로")
+            pipeline.run_profile(
+                ctx,
+                career_text=career_text,
+                kakao_paths=kakao_paths,
+                career_hwp_paths=hwp_paths,
+                career_source=source,
+                force_rebuild=force_rebuild,
+            )
+            print("✓ 학생 프로필 생성 완료\n")
 
     # Step 3: criteria
     if STEP_CRITERIA not in ctx.completed:

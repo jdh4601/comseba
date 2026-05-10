@@ -74,13 +74,27 @@ comseba --debug
 ```
 students/
   {학생이름}/
+    profile.json              # 학생 단위 영속 프로필 — 모든 세션이 공유
+    profile_history/          # 프로필 갱신 이력 (ISO 시각 스냅샷)
+      2026-05-10T14-30-00.json
     YYYY-MM-DD_session{N}/
-      session.json
+      session.json            # 진행 상태 + 사용한 프로필 갱신 시각
       rubric.json
       evaluation.json
+      model_answer.txt
       report.md
       sms.txt
 ```
+
+**학생 프로필**은 학생 디렉토리 바로 아래에 보관돼 여러 세션이 공유합니다.
+같은 학생으로 새 세션을 시작하면 기존 프로필 요약을 보여주고 다음 중 선택합니다:
+
+- **그대로 사용** — LLM 재호출 없이 기존 프로필로 진행
+- **업데이트** — 새 진로 정보 입력, 직전 버전은 `profile_history/` 로 자동 보관
+- **처음부터 다시 만들기** — 새로 빌드, 직전 버전은 history 로 보관
+
+학생 프로필은 한 번 빌드되면 이후 세션에서 자동으로 재사용됩니다 — 학기 동안 진로가
+바뀔 때만 업데이트하세요.
 
 ## 개발
 

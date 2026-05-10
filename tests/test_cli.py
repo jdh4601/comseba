@@ -5,6 +5,7 @@ questionary 호출과 LLM 호출은 모두 mock. 파일 I/O 만 실제 (tmp_path
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -123,14 +124,19 @@ def test_pipeline_runs_full_happy_path(ctx: _SessionContext) -> None:
         STEP_REPORT,
         STEP_SMS,
     }
-    # files persisted
-    assert (ctx.session_path / "profile.json").is_file()
+    # student-level profile (shared across sessions)
+    assert (ctx.session_path.parent / "profile.json").is_file()
+    # session-level files
     assert (ctx.session_path / "rubric.json").is_file()
     assert (ctx.session_path / "suggestions.json").is_file()
     assert (ctx.session_path / "evaluation.json").is_file()
     assert (ctx.session_path / "model_answer.txt").is_file()
     assert (ctx.session_path / "report.md").is_file()
     assert (ctx.session_path / "sms.txt").is_file()
+    # session.json carries profile snapshot reference
+    state = ctx.storage.load_session_state(ctx.session_path)
+    assert state["profile_action"] == "created"
+    assert state["profile_updated_at"] is not None
 
 
 def test_pipeline_skip_suggestions_persists_empty_list(
@@ -261,3 +267,107 @@ def test_pipeline_model_answer_uses_evaluation_when_available(
 
     _, kwargs = modules.model_answer_generator.generate.call_args
     assert kwargs["evaluation"] == ctx.evaluation
+
+
+# ---------------------------------------------------------------------------
+# COM-20: student-level profile reuse / rebuild
+# ---------------------------------------------------------------------------
+
+
+def test_run_profile_creates_student_level_file_with_action_created(
+    ctx: _SessionContext,
+) -> None:
+    modules = _modules()
+    p = Pipeline(modules)
+
+    p.run_profile(ctx, "career", [])
+
+    assert ctx.profile_action == "created"
+    assert ctx.profile_updated_at is not None
+    # 파일은 학생 디렉토리에 (세션 디렉토리 X)
+    assert (ctx.session_path.parent / "profile.json").is_file()
+    assert not (ctx.session_path / "profile.json").is_file()
+
+
+def test_run_profile_reuses_existing_without_calling_llm(
+    tmp_path: Path,
+) -> None:
+    storage = LocalStorage(base_dir=tmp_path / "students")
+    storage.save_profile(
+        "홍길동",
+        {
+            "name": "홍길동",
+            "career_goal": "기존 진로",
+            "inferred_needs": ["기존 니즈"],
+            "communication_style": None,
+            "updated_at": "2026-04-01T10:00:00",
+        },
+    )
+    session_path = storage.new_session("홍길동")
+    ctx = _SessionContext(
+        storage=storage, session_path=session_path, student_name="홍길동"
+    )
+    modules = _modules()
+    p = Pipeline(modules)
+
+    p.run_profile(ctx, "이번에 입력한 진로 (무시되어야 함)", [])
+
+    modules.profile_builder.build.assert_not_called()
+    assert ctx.profile_action == "reused"
+    assert ctx.profile is not None
+    assert ctx.profile.career_goal == "기존 진로"
+    assert ctx.profile_updated_at == "2026-04-01T10:00:00"
+
+
+def test_run_profile_force_rebuild_archives_previous_and_calls_llm(
+    tmp_path: Path,
+) -> None:
+    storage = LocalStorage(base_dir=tmp_path / "students")
+    storage.save_profile("홍길동", {"name": "홍길동", "career_goal": "v1"})
+    session_path = storage.new_session("홍길동")
+    ctx = _SessionContext(
+        storage=storage, session_path=session_path, student_name="홍길동"
+    )
+    modules = _modules()
+    p = Pipeline(modules)
+
+    p.run_profile(
+        ctx,
+        career_text="새 진로 입력",
+        kakao_paths=[],
+        force_rebuild=True,
+    )
+
+    modules.profile_builder.build.assert_called_once()
+    assert ctx.profile_action == "updated"
+    history = storage.list_profile_history("홍길동")
+    # save_profile 의 archive 1개 (force_rebuild 진입 시점)
+    assert len(history) == 1
+    archived = json.loads(history[0].read_text(encoding="utf-8"))
+    assert archived["career_goal"] == "v1"
+
+
+def test_run_profile_session_meta_records_action_and_timestamp(
+    ctx: _SessionContext,
+) -> None:
+    p = Pipeline(_modules())
+
+    p.run_profile(ctx, "career", [])
+
+    state = ctx.storage.load_session_state(ctx.session_path)
+    assert state["profile_action"] == "created"
+    assert state["profile_updated_at"] is not None
+
+
+def test_run_report_passes_profile_updated_at(ctx: _SessionContext) -> None:
+    modules = _modules()
+    p = Pipeline(modules)
+    p.run_profile(ctx, "career", [])
+    p.run_criteria(ctx, [Path("r.png")])
+    p.run_evaluation(ctx, "본문", [], [])
+    p.run_model_answer(ctx)
+
+    p.run_report(ctx)
+
+    _, kwargs = modules.report_generator.generate.call_args
+    assert kwargs["profile_updated_at"] == ctx.profile_updated_at
