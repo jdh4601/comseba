@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 from comseba.client import DEFAULT_MODEL, get_client
 from comseba.image_parser import ImageParser
+from comseba.subject import Subject, format_subject_block
 
 if TYPE_CHECKING:
     from anthropic import Anthropic
@@ -82,7 +83,11 @@ class EvaluationCriteriaExtractor:
         self._image_parser = image_parser
         self._model = model
 
-    def extract(self, image_paths: list[Path]) -> list[Criterion]:
+    def extract(
+        self,
+        image_paths: list[Path],
+        subject: Subject | None = None,
+    ) -> list[Criterion]:
         if not image_paths:
             raise ValueError("평가 기준 이미지가 최소 1장 필요합니다.")
 
@@ -97,7 +102,7 @@ class EvaluationCriteriaExtractor:
         response = self._client.messages.create(
             model=self._model,
             max_tokens=2048,
-            system=_NORMALIZE_SYSTEM,
+            system=_NORMALIZE_SYSTEM + format_subject_block(subject),
             messages=[
                 {
                     "role": "user",

@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 from comseba.client import DEFAULT_MODEL, get_client
 from comseba.criteria_extractor import Criterion
 from comseba.profile_builder import StudentProfile
+from comseba.subject import Subject, format_subject_block
 
 if TYPE_CHECKING:
     from anthropic import Anthropic
@@ -85,6 +86,7 @@ class AssessmentSuggestionEngine:
         profile: StudentProfile,
         criteria: list[Criterion],
         count: int = 4,
+        subject: Subject | None = None,
     ) -> list[AssessmentIdea]:
         if not (_MIN_IDEAS <= count <= _MAX_IDEAS):
             raise ValueError(
@@ -105,7 +107,8 @@ class AssessmentSuggestionEngine:
             model=self._model,
             max_tokens=2048,
             system=_SYSTEM_PROMPT
-            + f"\n\n[현재 분석 대상 학생의 진로]\n{profile.career_goal}",
+            + f"\n\n[현재 분석 대상 학생의 진로]\n{profile.career_goal}"
+            + format_subject_block(subject),
             messages=[{"role": "user", "content": prompt}],
         )
         raw = "".join(

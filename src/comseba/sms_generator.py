@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 from comseba.client import DEFAULT_MODEL, get_client
 from comseba.profile_builder import StudentProfile
+from comseba.subject import Subject, format_subject_block
 from comseba.submission_evaluator import CriterionFeedback
 
 if TYPE_CHECKING:
@@ -86,6 +87,7 @@ class SmsContentGenerator:
         profile: StudentProfile,
         evaluation: list[CriterionFeedback],
         assessment_name: str,
+        subject: Subject | None = None,
     ) -> str:
         if not assessment_name.strip():
             raise ValueError("수행평가명이 비어 있습니다.")
@@ -105,7 +107,7 @@ class SmsContentGenerator:
         response = self._client.messages.create(
             model=self._model,
             max_tokens=self._max_tokens,
-            system=_SYSTEM_PROMPT,
+            system=_SYSTEM_PROMPT + format_subject_block(subject),
             messages=[{"role": "user", "content": prompt}],
         )
         raw = "".join(

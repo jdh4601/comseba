@@ -22,6 +22,7 @@ from comseba.image_parser import (
     UnsupportedImageFormatError,
     _MEDIA_TYPES,  # noqa: PLC2701  — 의도적 재사용
 )
+from comseba.subject import Subject, format_subject_block
 
 if TYPE_CHECKING:
     from anthropic import Anthropic
@@ -88,6 +89,7 @@ class SubmissionEvaluator:
         submission_text: str | None = None,
         submission_image_paths: list[Path] | None = None,
         submission_pdf_paths: list[Path] | None = None,
+        subject: Subject | None = None,
     ) -> list[CriterionFeedback]:
         if not criteria:
             raise ValueError("평가 기준이 비어 있습니다.")
@@ -121,7 +123,7 @@ class SubmissionEvaluator:
         response = self._client.messages.create(
             model=self._model,
             max_tokens=self._max_tokens,
-            system=_SYSTEM_PROMPT,
+            system=_SYSTEM_PROMPT + format_subject_block(subject),
             messages=[{"role": "user", "content": content}],
         )
         raw = "".join(
