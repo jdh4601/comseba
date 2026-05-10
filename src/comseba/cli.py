@@ -1,11 +1,463 @@
-"""InteractiveCLI — orchestration entry point (stub)."""
+"""InteractiveCLI — orchestrates all modules with step-by-step prompts.
+
+Resume 가능하도록 설계: 각 스텝의 결과물을 즉시 디스크에 저장하고
+session.json 의 `completed_steps` 에 기록한다. 재개 시 완료된 스텝은
+디스크에서 로드만 하고 LLM 을 다시 호출하지 않는다.
+
+questionary 호출은 `_io` 모듈에 격리해 테스트에서 mock 가능하도록 분리.
+"""
 
 from __future__ import annotations
 
+import sys
+import traceback
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 
-def main() -> None:
-    raise NotImplementedError("Implemented in COM-15")
+import questionary
+
+from comseba.criteria_extractor import (
+    Criterion,
+    EvaluationCriteriaExtractor,
+)
+from comseba.model_answer_generator import ModelAnswerGenerator
+from comseba.profile_builder import StudentProfile, StudentProfileBuilder
+from comseba.report_generator import ReportGenerator
+from comseba.sms_generator import SmsContentGenerator
+from comseba.storage import LocalStorage
+from comseba.submission_evaluator import (
+    CriterionFeedback,
+    SubmissionEvaluator,
+)
+from comseba.suggestion_engine import (
+    AssessmentIdea,
+    AssessmentSuggestionEngine,
+)
+
+# 각 스텝에 부여한 이름 — session.json 의 completed_steps 에 기록되는 키.
+STEP_PROFILE = "profile"
+STEP_CRITERIA = "criteria"
+STEP_SUGGESTIONS = "suggestions"
+STEP_EVALUATION = "evaluation"
+STEP_MODEL_ANSWER = "model_answer"
+STEP_REPORT = "report"
+STEP_SMS = "sms"
+
+
+@dataclass
+class _Modules:
+    """Bag of module instances — constructed once, injected for tests."""
+
+    profile_builder: StudentProfileBuilder
+    criteria_extractor: EvaluationCriteriaExtractor
+    suggestion_engine: AssessmentSuggestionEngine
+    submission_evaluator: SubmissionEvaluator
+    model_answer_generator: ModelAnswerGenerator
+    report_generator: ReportGenerator
+    sms_generator: SmsContentGenerator
+
+
+@dataclass
+class _SessionContext:
+    """All state that flows between steps within one session."""
+
+    storage: LocalStorage
+    session_path: Path
+    student_name: str
+    completed: set[str] = field(default_factory=set)
+
+    profile: StudentProfile | None = None
+    criteria: list[Criterion] | None = None
+    suggestions: list[AssessmentIdea] = field(default_factory=list)
+    evaluation: list[CriterionFeedback] | None = None
+    model_answer: str | None = None
+    assessment_name: str | None = None
+
+    def mark(self, step: str) -> None:
+        if step in self.completed:
+            return
+        self.completed.add(step)
+        self.storage.mark_step_completed(self.session_path, step)
+
+
+# ---------------------------------------------------------------------------
+# IO layer — questionary calls. Tests substitute this whole module-level shim.
+# ---------------------------------------------------------------------------
+
+
+def _ask_text(message: str, default: str = "") -> str:
+    answer = questionary.text(message, default=default).ask()
+    if answer is None:  # Ctrl-C
+        raise KeyboardInterrupt
+    return answer
+
+
+def _ask_multiline(message: str) -> str:
+    print(message + " (입력을 마치려면 빈 줄에서 Ctrl-D)")
+    lines = sys.stdin.read()
+    return lines
+
+
+def _ask_path_list(message: str) -> list[Path]:
+    raw = _ask_text(f"{message} (쉼표로 여러 개, 비우면 건너뜀)", default="")
+    if not raw.strip():
+        return []
+    return [Path(p.strip()).expanduser() for p in raw.split(",") if p.strip()]
+
+
+def _ask_confirm(message: str, default: bool = True) -> bool:
+    answer = questionary.confirm(message, default=default).ask()
+    if answer is None:
+        raise KeyboardInterrupt
+    return bool(answer)
+
+
+def _ask_select(message: str, choices: list[str]) -> str:
+    answer = questionary.select(message, choices=choices).ask()
+    if answer is None:
+        raise KeyboardInterrupt
+    return str(answer)
+
+
+# ---------------------------------------------------------------------------
+# Pipeline — pure orchestration, no questionary calls. Tests drive this directly.
+# ---------------------------------------------------------------------------
+
+
+class Pipeline:
+    """Runs the 7 LLM-driven steps over a session, with resume support.
+
+    The CLI shell handles all questionary I/O and constructs the session
+    context. This class only orchestrates the modules and persists state.
+    """
+
+    def __init__(self, modules: _Modules) -> None:
+        self._m = modules
+
+    def run_profile(
+        self, ctx: _SessionContext, career_text: str, kakao_paths: list[Path]
+    ) -> StudentProfile:
+        if STEP_PROFILE in ctx.completed and ctx.profile is not None:
+            return ctx.profile
+        profile = self._m.profile_builder.build(
+            ctx.student_name, career_text, kakao_image_paths=kakao_paths or None
+        )
+        ctx.profile = profile
+        ctx.storage.save_json(
+            ctx.session_path, "profile.json", _profile_to_dict(profile)
+        )
+        ctx.mark(STEP_PROFILE)
+        return profile
+
+    def run_criteria(
+        self, ctx: _SessionContext, image_paths: list[Path]
+    ) -> list[Criterion]:
+        if STEP_CRITERIA in ctx.completed and ctx.criteria is not None:
+            return ctx.criteria
+        criteria = self._m.criteria_extractor.extract(image_paths)
+        ctx.criteria = criteria
+        ctx.storage.save_json(
+            ctx.session_path,
+            "rubric.json",
+            {"criteria": EvaluationCriteriaExtractor.to_dict_list(criteria)},
+        )
+        ctx.mark(STEP_CRITERIA)
+        return criteria
+
+    def run_suggestions(
+        self,
+        ctx: _SessionContext,
+        skip: bool,
+        count: int = 4,
+    ) -> list[AssessmentIdea]:
+        if STEP_SUGGESTIONS in ctx.completed:
+            return ctx.suggestions
+        if skip:
+            ctx.suggestions = []
+        else:
+            assert ctx.profile is not None and ctx.criteria is not None
+            ctx.suggestions = self._m.suggestion_engine.suggest(
+                ctx.profile, ctx.criteria, count=count
+            )
+        ctx.storage.save_json(
+            ctx.session_path,
+            "suggestions.json",
+            {"ideas": [asdict(i) for i in ctx.suggestions]},
+        )
+        ctx.mark(STEP_SUGGESTIONS)
+        return ctx.suggestions
+
+    def run_evaluation(
+        self,
+        ctx: _SessionContext,
+        submission_text: str | None,
+        image_paths: list[Path],
+        pdf_paths: list[Path],
+    ) -> list[CriterionFeedback]:
+        if STEP_EVALUATION in ctx.completed and ctx.evaluation is not None:
+            return ctx.evaluation
+        assert ctx.criteria is not None
+        evaluation = self._m.submission_evaluator.evaluate(
+            ctx.criteria,
+            submission_text=submission_text,
+            submission_image_paths=image_paths or None,
+            submission_pdf_paths=pdf_paths or None,
+        )
+        ctx.evaluation = evaluation
+        ctx.storage.save_json(
+            ctx.session_path,
+            "evaluation.json",
+            {"feedback": [asdict(f) for f in evaluation]},
+        )
+        ctx.mark(STEP_EVALUATION)
+        return evaluation
+
+    def run_model_answer(self, ctx: _SessionContext) -> str:
+        if STEP_MODEL_ANSWER in ctx.completed and ctx.model_answer is not None:
+            return ctx.model_answer
+        assert ctx.profile is not None and ctx.criteria is not None
+        ctx.model_answer = self._m.model_answer_generator.generate(
+            ctx.criteria, ctx.profile, evaluation=ctx.evaluation
+        )
+        ctx.storage.save_text(ctx.session_path, "model_answer.txt", ctx.model_answer)
+        ctx.mark(STEP_MODEL_ANSWER)
+        return ctx.model_answer
+
+    def run_report(self, ctx: _SessionContext) -> str:
+        if STEP_REPORT in ctx.completed:
+            return ctx.storage.load_text(ctx.session_path, "report.md")
+        assert (
+            ctx.profile is not None
+            and ctx.criteria is not None
+            and ctx.evaluation is not None
+            and ctx.model_answer is not None
+        )
+        report = self._m.report_generator.generate(
+            ctx.profile, ctx.criteria, ctx.evaluation, ctx.model_answer
+        )
+        ctx.storage.save_text(ctx.session_path, "report.md", report)
+        ctx.mark(STEP_REPORT)
+        return report
+
+    def run_sms(self, ctx: _SessionContext, assessment_name: str) -> str:
+        if STEP_SMS in ctx.completed:
+            return ctx.storage.load_text(ctx.session_path, "sms.txt")
+        assert ctx.profile is not None and ctx.evaluation is not None
+        ctx.assessment_name = assessment_name
+        sms = self._m.sms_generator.generate(
+            ctx.profile, ctx.evaluation, assessment_name=assessment_name
+        )
+        ctx.storage.save_text(ctx.session_path, "sms.txt", sms)
+        ctx.mark(STEP_SMS)
+        return sms
+
+
+# ---------------------------------------------------------------------------
+# Serialization helpers — keep dataclasses in code, dicts on disk.
+# ---------------------------------------------------------------------------
+
+
+def _profile_to_dict(profile: StudentProfile) -> dict:
+    return asdict(profile)
+
+
+def _profile_from_dict(data: dict) -> StudentProfile:
+    return StudentProfile(
+        name=data["name"],
+        career_goal=data["career_goal"],
+        inferred_needs=list(data.get("inferred_needs") or []),
+        communication_style=data.get("communication_style"),
+    )
+
+
+def _criteria_from_dict(data: dict) -> list[Criterion]:
+    return [
+        Criterion(
+            name=c["name"],
+            description=c["description"],
+            max_score=c.get("max_score"),
+        )
+        for c in data["criteria"]
+    ]
+
+
+def _suggestions_from_dict(data: dict) -> list[AssessmentIdea]:
+    return [
+        AssessmentIdea(
+            title=i["title"], description=i["description"], rationale=i["rationale"]
+        )
+        for i in data.get("ideas", [])
+    ]
+
+
+def _evaluation_from_dict(data: dict) -> list[CriterionFeedback]:
+    return [
+        CriterionFeedback(
+            criterion=f["criterion"], feedback=f["feedback"], met=f["met"]
+        )
+        for f in data["feedback"]
+    ]
+
+
+def _restore_state(ctx: _SessionContext) -> None:
+    """Rehydrate dataclass state from disk for any already-completed step."""
+    sp = ctx.session_path
+    if STEP_PROFILE in ctx.completed:
+        ctx.profile = _profile_from_dict(ctx.storage.load_json(sp, "profile.json"))
+    if STEP_CRITERIA in ctx.completed:
+        ctx.criteria = _criteria_from_dict(ctx.storage.load_json(sp, "rubric.json"))
+    if STEP_SUGGESTIONS in ctx.completed:
+        ctx.suggestions = _suggestions_from_dict(
+            ctx.storage.load_json(sp, "suggestions.json")
+        )
+    if STEP_EVALUATION in ctx.completed:
+        ctx.evaluation = _evaluation_from_dict(
+            ctx.storage.load_json(sp, "evaluation.json")
+        )
+    if STEP_MODEL_ANSWER in ctx.completed:
+        ctx.model_answer = ctx.storage.load_text(sp, "model_answer.txt")
+
+
+# ---------------------------------------------------------------------------
+# Top-level CLI loop — questionary prompts wired into Pipeline.
+# ---------------------------------------------------------------------------
+
+
+def _build_modules() -> _Modules:
+    return _Modules(
+        profile_builder=StudentProfileBuilder(),
+        criteria_extractor=EvaluationCriteriaExtractor(),
+        suggestion_engine=AssessmentSuggestionEngine(),
+        submission_evaluator=SubmissionEvaluator(),
+        model_answer_generator=ModelAnswerGenerator(),
+        report_generator=ReportGenerator(),
+        sms_generator=SmsContentGenerator(),
+    )
+
+
+def _open_or_create_session(storage: LocalStorage, student_name: str) -> _SessionContext:
+    existing = storage.list_sessions(student_name)
+    if existing:
+        choices = ["새 세션 시작"] + [s.name for s in existing]
+        choice = _ask_select("어떤 세션으로 진행할까요?", choices)
+        if choice != "새 세션 시작":
+            session_path = next(s for s in existing if s.name == choice)
+            state = storage.load_session_state(session_path)
+            ctx = _SessionContext(
+                storage=storage,
+                session_path=session_path,
+                student_name=student_name,
+                completed=set(state.get("completed_steps") or []),
+            )
+            _restore_state(ctx)
+            return ctx
+
+    session_path = storage.new_session(student_name)
+    return _SessionContext(
+        storage=storage, session_path=session_path, student_name=student_name
+    )
+
+
+def _run(debug: bool = False) -> int:
+    print("=== 수행평가 보조 AI (comseba) ===\n")
+    storage = LocalStorage()
+    pipeline = Pipeline(_build_modules())
+
+    student_name = _ask_text("학생 이름을 입력하세요").strip()
+    if not student_name:
+        print("학생 이름이 비어 있어 종료합니다.")
+        return 1
+
+    ctx = _open_or_create_session(storage, student_name)
+    print(f"세션 경로: {ctx.session_path}\n")
+
+    # Step 1-2: profile
+    if STEP_PROFILE not in ctx.completed:
+        career_text = _ask_text("학생의 진로 / 목표를 적어주세요")
+        kakao_paths = _ask_path_list("카카오톡 스크린샷 경로")
+        pipeline.run_profile(ctx, career_text, kakao_paths)
+        print("✓ 학생 프로필 생성 완료\n")
+
+    # Step 3: criteria
+    if STEP_CRITERIA not in ctx.completed:
+        rubric_paths = _ask_path_list("평가 기준 이미지 경로 (최소 1장)")
+        if not rubric_paths:
+            print("평가 기준 이미지가 필요합니다. 종료합니다.")
+            return 1
+        criteria = pipeline.run_criteria(ctx, rubric_paths)
+        pipeline._m.criteria_extractor.display(criteria)
+        if not _ask_confirm("위 평가 기준이 맞나요?"):
+            print("재시도가 필요한 경우 세션을 새로 시작해주세요.")
+            return 1
+
+    # Step 4: suggestions (skippable)
+    if STEP_SUGGESTIONS not in ctx.completed:
+        skip = not _ask_confirm("수행평가 아이디어를 제안받을까요?", default=True)
+        ideas = pipeline.run_suggestions(ctx, skip=skip)
+        if ideas:
+            print("\n=== 수행평가 아이디어 ===")
+            for i, idea in enumerate(ideas, 1):
+                print(f"{i}. {idea.title}\n   {idea.description}\n   (이유: {idea.rationale})")
+            print()
+
+    # Step 5: evaluation
+    if STEP_EVALUATION not in ctx.completed:
+        mode = _ask_select(
+            "제출물을 어떻게 입력하시겠어요?",
+            ["파일 (PDF / 이미지)", "직접 텍스트 입력"],
+        )
+        if mode == "파일 (PDF / 이미지)":
+            pdfs = [p for p in _ask_path_list("PDF 경로") if p.suffix.lower() == ".pdf"]
+            imgs = [
+                p
+                for p in _ask_path_list("이미지 경로")
+                if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+            ]
+            text = None
+        else:
+            text = _ask_multiline("제출물 텍스트를 붙여넣으세요")
+            pdfs, imgs = [], []
+        pipeline.run_evaluation(ctx, text, imgs, pdfs)
+        print("✓ 항목별 피드백 생성 완료\n")
+
+    # Step 6: model answer
+    if STEP_MODEL_ANSWER not in ctx.completed:
+        pipeline.run_model_answer(ctx)
+        print("✓ 예시 답안 생성 완료\n")
+
+    # Step 7: report
+    if STEP_REPORT not in ctx.completed:
+        pipeline.run_report(ctx)
+        print(f"✓ 보고서 저장: {ctx.session_path / 'report.md'}\n")
+
+    # Step 8: SMS
+    if STEP_SMS not in ctx.completed:
+        assessment_name = _ask_text("수행평가명을 입력하세요 (예: 환경 보고서 글쓰기)")
+        if not assessment_name.strip():
+            print("수행평가명이 비어 있어 SMS 단계를 건너뜁니다.")
+        else:
+            pipeline.run_sms(ctx, assessment_name=assessment_name)
+            print(f"✓ 학부모 문자 초안 저장: {ctx.session_path / 'sms.txt'}\n")
+
+    print(f"=== 완료 — 세션 결과: {ctx.session_path} ===")
+    return 0
+
+
+def main() -> int:
+    debug = "--debug" in sys.argv[1:]
+    try:
+        return _run(debug=debug)
+    except KeyboardInterrupt:
+        print("\n사용자가 중단했습니다. 진행한 단계는 저장되어 있습니다.")
+        return 130
+    except Exception as exc:  # noqa: BLE001 — top-level user-facing wrapper
+        if debug:
+            traceback.print_exc()
+        else:
+            print(f"\n오류가 발생했습니다: {exc}", file=sys.stderr)
+            print("자세한 내용을 보려면 `--debug` 플래그로 다시 실행하세요.", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
