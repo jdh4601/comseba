@@ -25,6 +25,7 @@ class ReportGenerator:
         criteria: list[Criterion],
         evaluation: list[CriterionFeedback],
         model_answer: str,
+        profile_updated_at: str | None = None,
     ) -> str:
         if not criteria:
             raise ValueError("평가 기준이 비어 있습니다.")
@@ -33,7 +34,7 @@ class ReportGenerator:
 
         sections = [
             f"# 수행평가 보고서 — {profile.name}",
-            _career_section(profile),
+            _career_section(profile, profile_updated_at),
             _criteria_section(criteria),
             _evaluation_section(evaluation),
             _model_answer_section(model_answer),
@@ -42,13 +43,17 @@ class ReportGenerator:
         return "\n\n".join(sections).rstrip() + "\n"
 
 
-def _career_section(profile: StudentProfile) -> str:
+def _career_section(
+    profile: StudentProfile, profile_updated_at: str | None = None
+) -> str:
     lines = ["## 학생 진로 요약", "", f"- **이름**: {profile.name}", f"- **진로 / 목표**: {profile.career_goal}"]
     if profile.inferred_needs:
         needs = ", ".join(profile.inferred_needs)
         lines.append(f"- **파악된 니즈**: {needs}")
     if profile.communication_style:
         lines.append(f"- **소통 스타일**: {profile.communication_style}")
+    if profile_updated_at:
+        lines.append(f"- **프로필 갱신**: {profile_updated_at}")
     return "\n".join(lines)
 
 

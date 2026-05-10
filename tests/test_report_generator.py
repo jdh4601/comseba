@@ -153,3 +153,23 @@ def test_report_ends_with_single_trailing_newline() -> None:
 
     assert report.endswith("\n")
     assert not report.endswith("\n\n")
+
+
+def test_report_includes_profile_updated_at_when_provided() -> None:
+    report = ReportGenerator().generate(
+        _profile(),
+        _criteria(),
+        _evaluation(),
+        model_answer="x",
+        profile_updated_at="2026-05-10T14:30:00",
+    )
+
+    assert "**프로필 갱신**: 2026-05-10T14:30:00" in report
+
+
+def test_report_omits_profile_updated_at_when_not_provided() -> None:
+    report = ReportGenerator().generate(
+        _profile(), _criteria(), _evaluation(), model_answer="x"
+    )
+
+    assert "프로필 갱신" not in report
