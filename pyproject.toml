@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "comseba"
+version = "0.1.0"
+description = "수행평가 보조 AI CLI — 교사용 인터랙티브 평가 보조 도구"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Donghyun Jeong", email = "jdh9490@gmail.com" }]
+dependencies = [
+    "anthropic>=0.40.0",
+    "questionary>=2.0.1",
+    "python-dotenv>=1.0.1",
+    "pypdf>=4.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-mock>=3.12.0",
+    "ruff>=0.6.0",
+    "mypy>=1.10.0",
+]
+
+[project.scripts]
+comseba = "comseba.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q"
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
