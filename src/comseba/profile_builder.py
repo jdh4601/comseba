@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from comseba.client import DEFAULT_MODEL, get_client
+from comseba.hwp_parser import HwpParser
 from comseba.image_parser import ImageParser
 
 if TYPE_CHECKING:
@@ -74,32 +75,45 @@ class StudentProfileBuilder:
         self,
         client: Anthropic | None = None,
         image_parser: ImageParser | None = None,
+        hwp_parser: HwpParser | None = None,
         model: str = DEFAULT_MODEL,
     ) -> None:
         self._client = client if client is not None else get_client()
-        # ImageParser 는 자체적으로 client.get_client() 를 호출하므로,
-        # 명시 주입이 없을 때만 lazy 로 생성한다 (테스트에서는 주입).
+        # 부분 모듈은 자체적으로 클라이언트 / 자원을 갖고 있어, 명시 주입이 없을 때만
+        # lazy 생성 (테스트에서는 mock 주입).
         self._image_parser = image_parser
+        self._hwp_parser = hwp_parser
         self._model = model
 
     def build(
         self,
         name: str,
-        career_text: str,
+        career_text: str | None = None,
         kakao_image_paths: list[Path] | None = None,
+        career_hwp_paths: list[Path] | None = None,
     ) -> StudentProfile:
         if not name.strip():
             raise ValueError("학생 이름이 비어 있습니다.")
-        if not career_text.strip():
-            raise ValueError("학생 진로 텍스트가 비어 있습니다.")
+
+        text_part = (career_text or "").strip()
+        hwp_text = self._extract_hwp_text(career_hwp_paths)
+        if not text_part and not hwp_text:
+            raise ValueError(
+                "학생 진로 정보가 비어 있습니다 — 텍스트 또는 HWP/HWPX 파일 중 "
+                "최소 하나는 필요합니다."
+            )
+
+        # career_goal 은 다운스트림 모듈들의 personalization anchor — 텍스트 입력과
+        # HWP 추출 텍스트를 모두 합쳐 풍부한 컨텍스트로 만든다.
+        combined_career = "\n\n".join(p for p in (text_part, hwp_text) if p)
 
         kakao_text = self._extract_kakao_text(kakao_image_paths)
-        prompt = self._render_prompt(name, career_text, kakao_text)
+        prompt = self._render_prompt(name, combined_career, kakao_text)
 
         response = self._client.messages.create(
             model=self._model,
             max_tokens=1024,
-            system=_SYSTEM_PROMPT + f"\n\n[현재 분석 대상 학생의 진로]\n{career_text}",
+            system=_SYSTEM_PROMPT + f"\n\n[현재 분석 대상 학생의 진로]\n{combined_career}",
             messages=[{"role": "user", "content": prompt}],
         )
 
@@ -110,7 +124,7 @@ class StudentProfileBuilder:
 
         return StudentProfile(
             name=name.strip(),
-            career_goal=career_text.strip(),
+            career_goal=combined_career,
             inferred_needs=[str(n) for n in parsed.get("inferred_needs", [])],
             communication_style=_normalize_style(parsed.get("communication_style")),
         )
@@ -122,6 +136,15 @@ class StudentProfileBuilder:
             return None
         parser = self._image_parser or ImageParser()
         chunks = [parser.parse(p, _KAKAO_OCR_PROMPT) for p in kakao_image_paths]
+        return "\n\n---\n\n".join(c.strip() for c in chunks if c.strip()) or None
+
+    def _extract_hwp_text(
+        self, career_hwp_paths: list[Path] | None
+    ) -> str | None:
+        if not career_hwp_paths:
+            return None
+        parser = self._hwp_parser or HwpParser()
+        chunks = [parser.parse(p) for p in career_hwp_paths]
         return "\n\n---\n\n".join(c.strip() for c in chunks if c.strip()) or None
 
     @staticmethod

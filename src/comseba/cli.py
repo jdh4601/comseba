@@ -119,6 +119,52 @@ def _ask_select(message: str, choices: list[str]) -> str:
     return str(answer)
 
 
+_CAREER_SOURCE_TEXT = "직접 텍스트 입력"
+_CAREER_SOURCE_HWP = "HWP / HWPX 파일 업로드"
+_CAREER_SOURCE_MIXED = "혼합 (텍스트 + HWP 파일)"
+_HWP_SUFFIXES = {".hwp", ".hwpx"}
+
+
+def _ask_career_inputs() -> tuple[str | None, list[Path], str]:
+    """Ask for the student's career info via one of three modes.
+
+    Returns:
+        (career_text, hwp_paths, source_label) where source_label is one of
+        "text" / "hwp" / "mixed" — persisted to session.json so reports / future
+        sessions know how the input was supplied.
+    """
+    choice = _ask_select(
+        "학생 진로 정보를 어떻게 입력하시겠어요?",
+        [_CAREER_SOURCE_TEXT, _CAREER_SOURCE_HWP, _CAREER_SOURCE_MIXED],
+    )
+    if choice == _CAREER_SOURCE_TEXT:
+        return _ask_text("학생의 진로 / 목표를 적어주세요"), [], "text"
+
+    if choice == _CAREER_SOURCE_HWP:
+        paths = _filter_hwp_paths(_ask_path_list("HWP / HWPX 파일 경로"))
+        if not paths:
+            print("HWP / HWPX 파일이 필요합니다. 텍스트로 다시 시도해주세요.")
+            return _ask_text("학생의 진로 / 목표를 적어주세요"), [], "text"
+        return None, paths, "hwp"
+
+    # mixed
+    text = _ask_text("학생의 진로 / 목표를 적어주세요 (HWP 와 합쳐져 분석됩니다)")
+    paths = _filter_hwp_paths(_ask_path_list("HWP / HWPX 파일 경로"))
+    return text, paths, "mixed"
+
+
+def _filter_hwp_paths(paths: list[Path]) -> list[Path]:
+    """Drop paths whose extension isn't .hwp / .hwpx so HwpParser doesn't see
+    them and raise — caller can supply more files if needed."""
+    kept: list[Path] = []
+    for p in paths:
+        if p.suffix.lower() in _HWP_SUFFIXES:
+            kept.append(p)
+        else:
+            print(f"  (무시) HWP/HWPX 가 아닙니다: {p}")
+    return kept
+
+
 # ---------------------------------------------------------------------------
 # Pipeline — pure orchestration, no questionary calls. Tests drive this directly.
 # ---------------------------------------------------------------------------
@@ -135,16 +181,26 @@ class Pipeline:
         self._m = modules
 
     def run_profile(
-        self, ctx: _SessionContext, career_text: str, kakao_paths: list[Path]
+        self,
+        ctx: _SessionContext,
+        career_text: str | None,
+        kakao_paths: list[Path],
+        career_hwp_paths: list[Path] | None = None,
+        career_source: str = "text",
     ) -> StudentProfile:
         if STEP_PROFILE in ctx.completed and ctx.profile is not None:
             return ctx.profile
         profile = self._m.profile_builder.build(
-            ctx.student_name, career_text, kakao_image_paths=kakao_paths or None
+            ctx.student_name,
+            career_text=career_text,
+            kakao_image_paths=kakao_paths or None,
+            career_hwp_paths=career_hwp_paths or None,
         )
         ctx.profile = profile
         ctx.storage.save_json(
-            ctx.session_path, "profile.json", _profile_to_dict(profile)
+            ctx.session_path,
+            "profile.json",
+            {**_profile_to_dict(profile), "career_source": career_source},
         )
         ctx.mark(STEP_PROFILE)
         return profile
@@ -373,9 +429,15 @@ def _run(debug: bool = False) -> int:
 
     # Step 1-2: profile
     if STEP_PROFILE not in ctx.completed:
-        career_text = _ask_text("학생의 진로 / 목표를 적어주세요")
+        career_text, hwp_paths, source = _ask_career_inputs()
         kakao_paths = _ask_path_list("카카오톡 스크린샷 경로")
-        pipeline.run_profile(ctx, career_text, kakao_paths)
+        pipeline.run_profile(
+            ctx,
+            career_text=career_text,
+            kakao_paths=kakao_paths,
+            career_hwp_paths=hwp_paths,
+            career_source=source,
+        )
         print("✓ 학생 프로필 생성 완료\n")
 
     # Step 3: criteria
